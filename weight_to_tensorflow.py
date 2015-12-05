@@ -1,6 +1,7 @@
 import os
 os.environ["GLOG_minloglevel"] = "2"
 
+import cPickle
 import ipdb
 from utils import *
 import matplotlib.pyplot as plt
@@ -8,13 +9,6 @@ import skimage
 import caffe
 import numpy as np
 import tensorflow as tf
-
-
-FLAGS = tf.app.flags.FLAGS
-tf.app.flags.DEFINE_boolean('only_caffe', False,
-                            """Only run caffe""")
-tf.app.flags.DEFINE_boolean('only_tf', False,
-                            """Only run tf""")
 
 def tf_show_layer(image):
   skimage.io.imshow(image)
@@ -45,25 +39,11 @@ def deprocess(img):
   out /= 255
   return out
 
-#caffe.set_mode_cpu()
-net_caffe = caffe.Net("VGG_2014_16.prototxt", "VGG_ILSVRC_16_layers.caffemodel", caffe.TEST)
+with open("caffe_layers_value.pickle") as f:
+    print "Loading VGG weights ... "
+    caffe_layers_numpy = cPickle.load(f)
+    print "Done loading ..."
 
-
-caffe_layers = {}
-caffe_layers_numpy = {}
-
-for i, layer in enumerate(net_caffe.layers):
-    layer_name = net_caffe._layer_names[i]
-    caffe_layers[layer_name] = layer
-
-def caffe_to_numpy(layer_name):
-    layer = caffe_layers[layer_name]
-    if len(layer.blobs) > 0:
-        W = layer.blobs[0].data
-        b = layer.blobs[1].data
-        return [W,b]
-    else:
-        return None
 
 def caffe_weights(layer_name):
     layer = caffe_layers_numpy[layer_name]
@@ -73,11 +53,6 @@ def caffe_bias(layer_name):
     layer = caffe_layers_numpy[layer_name]
     return layer[1]#layer.blobs[1].data
 
-for k in caffe_layers.iterkeys():
-    caffe_layers_numpy[k] = caffe_to_numpy(k)
-
-
-ipdb.set_trace()
 # converts caffe filter to tf
 # tensorflow uses [filter_height, filter_width, in_channels, out_channels]
 #                  2               3            1            0
@@ -89,16 +64,6 @@ ipdb.set_trace()
 def caffe2tf_filter(name):
   f = caffe_weights(name)
   return f.transpose((2, 3, 1, 0))
-
-# caffe blobs are [ channel, height, width ]
-# this returns  [ height, width, channel ]
-def caffe2tf_conv_blob(name):
-  blob = net_caffe.blobs[name].data[0]
-  return blob.transpose((1, 2, 0))
-
-def caffe2tf_1d_blob(name):
-  blob = net_caffe.blobs[name].data[0]
-  return blob
 
 def conv_layer(m, bottom, name):
   with tf.variable_scope(name) as scope:
@@ -115,7 +80,7 @@ def conv_layer(m, bottom, name):
       m["conv1_1_weights"] = conv_weight
       m["conv1_1a"] = bias
 
-    relu = tf.nn.relu(bias)
+    relu = tf.nn.relu(bias, name=name)
     return relu
 
 def fc_layer(bottom, name):
@@ -141,7 +106,7 @@ def fc_layer(bottom, name):
 
   # Fully connected layer. Note that the '+' operation automatically
   # broadcasts the biases.
-  fc = tf.nn.bias_add(tf.matmul(x, weights), biases)
+  fc = tf.nn.bias_add(tf.matmul(x, weights), biases, name=name)
 
   return fc
 
@@ -230,89 +195,43 @@ def main():
   global tf_activations
 
   cat = load_image("cat.jpg")
+  print "tensorflow session"
 
-  run_caffe = not FLAGS.only_tf
-  run_tf = not FLAGS.only_caffe
-  ran_both = run_caffe and run_tf
+  images = tf.placeholder("float", [None, 224, 224, 3], name="images")
+  m = inference(images)
 
-  if run_caffe:
-    print "caffe session"
-    assert same_tensor(deprocess(preprocess(cat)), cat)
-    net_caffe.blobs['data'].data[0] = preprocess(cat)
-    assert net_caffe.blobs['data'].data[0].shape == (3, 224, 224)
-    #show_caffe_net_input()
-    net_caffe.forward()
-    prob = net_caffe.blobs['prob'].data[0]
-    top1 = print_prob(prob)
-    assert top1 == "n02123045 tabby, tabby cat"
+  with tf.Session() as sess:
+    sess.run(tf.initialize_all_variables())
 
-    caffe_activations = {
-      'conv1_1_weights': caffe_weights("conv1_1"),
-      'prob': net_caffe.blobs['prob'].data[0],
+    assert cat.shape == (224, 224, 3)
+    batch = cat.reshape((1, 224, 224, 3))
+    assert batch.shape == (1, 224, 224, 3)
+
+    out = sess.run([m['prob'], m['relu1_1'], m['conv1_1_weights'], \
+        m['conv1_1a'], m['pool5'], m['fc6a']], feed_dict={ images: batch })
+    tf_activations = {
+      'prob': out[0][0],
+      'relu1_1': out[1][0],
+      'conv1_1_weights': out[2],
+      'conv1_1a': out[3][0],
+      'pool5': out[4][0],
+      'fc6a': out[5][0],
     }
 
-    ipdb.set_trace()
+  top1 = print_prob(tf_activations['prob'])
+    ##assert top1 == "n02123045 tabby, tabby cat"
+  graph = tf.get_default_graph()
+  graph_def = graph.as_graph_def()
+  print "graph_def byte size", graph_def.ByteSize()
+  graph_def_s = graph_def.SerializeToString()
 
-  if run_tf:
-    print "tensorflow session"
+  save_path = "vgg16.tfmodel"
 
-    images = tf.placeholder("float", [None, 224, 224, 3], name="images")
-    m = inference(images)
+  with open(save_path, "wb") as f:
+    f.write(graph_def_s)
 
-    with tf.Session() as sess:
-      sess.run(tf.initialize_all_variables())
-
-      assert cat.shape == (224, 224, 3)
-      batch = cat.reshape((1, 224, 224, 3))
-      assert batch.shape == (1, 224, 224, 3)
-
-      out = sess.run([m['prob'], m['relu1_1'], m['conv1_1_weights'], \
-          m['conv1_1a'], m['pool5'], m['fc6a']], feed_dict={ images: batch })
-      tf_activations = {
-        'prob': out[0][0],
-        'relu1_1': out[1][0],
-        'conv1_1_weights': out[2],
-        'conv1_1a': out[3][0],
-        'pool5': out[4][0],
-        'fc6a': out[5][0],
-      }
-
-      top1 = print_prob(tf_activations['prob'])
-      ##assert top1 == "n02123045 tabby, tabby cat"
-
-  # Now we compare tf_activations to net_caffe's if we ran a forward pass
-  # in both networks.
-  if ran_both:
-    #print "shape tf conv1_1a", tf_activations["conv1_1a"].shape
-    #tf_show_layer(tf_activations["conv1_1a"][:, :, 0])
-    #tf_show_layer(caffe2tf_conv_blob("conv1_1a")[:, :, 0])
-
-    assert same_tensor(caffe2tf_conv_blob("conv1_1a"), tf_activations["conv1_1a"])
-
-    assert same_tensor(caffe2tf_filter("conv1_1"), tf_activations['conv1_1_weights'])
-
-    assert same_tensor(caffe2tf_conv_blob("conv1_1"), tf_activations['relu1_1'])
-
-    assert same_tensor(caffe2tf_conv_blob("pool5"), tf_activations['pool5'])
-
-    print "diff fc6a", np.linalg.norm(caffe2tf_1d_blob("fc6a") - tf_activations['fc6a'])
-    assert caffe_weights("fc6").shape == (4096, 25088)
-    assert caffe_bias("fc6").shape == (4096,)
-
-    assert same_tensor(caffe2tf_1d_blob("fc6a"), tf_activations['fc6a'])
-
-    assert same_tensor(caffe2tf_1d_blob("prob"), tf_activations['prob'])
-
-    graph = tf.get_default_graph()
-    graph_def = graph.as_graph_def()
-    print "graph_def byte size", graph_def.ByteSize()
-    graph_def_s = graph_def.SerializeToString()
-
-    save_path = "vgg16.tfmodel"
-    with open(save_path, "wb") as f:
-      f.write(graph_def_s)
-
-    print "saved model to %s" % save_path
+  ipdb.set_trace()
+  print "saved model to %s" % save_path
 
 
 if __name__ == "__main__":

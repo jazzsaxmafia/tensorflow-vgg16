@@ -1,6 +1,6 @@
 import tensorflow as tf
 import utils
-
+import ipdb
 
 with open("vgg16.tfmodel", mode='rb') as f:
   fileContent = f.read()
